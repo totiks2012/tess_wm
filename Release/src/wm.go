@@ -2,6 +2,10 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/gdamore/tcell/v2"
@@ -67,17 +71,41 @@ func (wm *WM) openShell() {
 
 // openShellAt starts a new shell window in the given directory ("" = inherit).
 func (wm *WM) openShellAt(dir string) {
+	wm.openPTYWindowAt("shell", []string{"/bin/bash"}, dir)
+}
+
+// openProgramAt starts a program (restored foreground program) in its own
+// window at dir. It returns false when the program cannot be started, so the
+// caller can fall back to a plain shell.
+func (wm *WM) openProgramAt(argv []string, dir string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	if _, err := exec.LookPath(argv[0]); err != nil {
+		return false
+	}
+	return wm.openPTYWindowAt(programTitle(argv), argv, dir)
+}
+
+// openPTYWindowAt is the shared constructor for shell and program windows.
+func (wm *WM) openPTYWindowAt(title string, argv []string, dir string) bool {
+	if dir != "" {
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			dir = ""
+		}
+	}
 	var sw *shellWindow
-	w, err := newShellWindow(wm.app, dir, func() {
+	w, err := newPTYWindow(wm.app, argv, dir, func() {
 		wm.app.QueueUpdateDraw(func() { wm.removeByShell(sw) })
 	}, func() bool {
 		return wm.isActiveWindow(sw) || wm.overviewOpen()
 	})
 	if err != nil {
-		return
+		return false
 	}
 	sw = w
-	wm.addWindow("shell", w, w)
+	wm.addWindow(title, w, w)
+	return true
 }
 
 // isActiveWindow reports whether the given content is the active window.
@@ -229,8 +257,10 @@ func (wm *WM) closeLocked(idx int, killContent bool) {
 	}
 }
 
-// snapshot captures the current workspace as session slots. Shell windows
-// record their live cwd (via /proc), widgets record only their name.
+// snapshot captures the current workspace as session slots. A shell window
+// records the program currently in its foreground (afm/micro/vim/...) with its
+// argv and live cwd; at a plain prompt it records `shell` + the live cwd of
+// the shell (or of a nested shell). Widgets record only their name.
 func (wm *WM) snapshot() []SessionWindow {
 	wm.mu.Lock()
 	wins := make([]*Window, len(wm.wins))
@@ -240,11 +270,24 @@ func (wm *WM) snapshot() []SessionWindow {
 	out := make([]SessionWindow, 0, len(wins))
 	for _, w := range wins {
 		if w.shell != nil {
+			argv, dir, atPrompt := w.shell.Foreground()
+			if dir == "" {
+				dir = w.shell.Cwd()
+			}
+			if atPrompt || len(argv) == 0 {
+				out = append(out, SessionWindow{
+					Kind: kindShell,
+					Argv: []string{"/bin/bash"},
+					Path: dir,
+					Name: w.title,
+				})
+				continue
+			}
 			out = append(out, SessionWindow{
-				Kind: kindShell,
-				Cmd:  "bash",
-				Path: w.shell.Cwd(),
-				Name: w.title,
+				Kind: kindProg,
+				Argv: argv,
+				Path: dir,
+				Name: programTitle(argv),
 			})
 			continue
 		}
@@ -253,17 +296,58 @@ func (wm *WM) snapshot() []SessionWindow {
 	return out
 }
 
-// restore replaces the current workspace with the given session slots.
-func (wm *WM) restore(wins []SessionWindow) {
+// restore replaces the current workspace with the given session slots. It
+// returns the number of program slots that had to fall back to a plain shell
+// (the program binary is gone or could not be started).
+func (wm *WM) restore(wins []SessionWindow) (fallbacks int) {
 	wm.closeAll()
 	for _, s := range wins {
 		switch s.Kind {
 		case kindShell:
 			wm.openShellAt(s.Path)
+		case kindProg:
+			if !wm.openProgramAt(restoreArgv(s), s.Path) {
+				wm.openShellAt(s.Path)
+				fallbacks++
+			}
 		case kindWidget:
 			wm.openWidget()
 		}
 	}
+	return fallbacks
+}
+
+// restoreArgv returns the argv to launch for a program slot. afm ignores its
+// working directory and starts in $HOME unless a directory is passed as the
+// first non-flag argument, so for afm the saved path is appended (best-effort:
+// the exact pane directory inside afm is not knowable from outside).
+func restoreArgv(s SessionWindow) []string {
+	argv := append([]string(nil), s.Argv...)
+	if len(argv) == 0 {
+		return argv
+	}
+	name := strings.ToLower(filepath.Base(argv[0]))
+	if name != "afm" && !strings.HasPrefix(name, "afm_linux") {
+		return argv
+	}
+	if argvHasPathArg(argv) || s.Path == "" {
+		return argv
+	}
+	if fi, err := os.Stat(s.Path); err != nil || !fi.IsDir() {
+		return argv
+	}
+	return append(argv, s.Path)
+}
+
+// argvHasPathArg reports whether argv already carries a positional (non-flag)
+// argument, e.g. `afm /tmp/x` or `micro file.txt`.
+func argvHasPathArg(argv []string) bool {
+	for _, a := range argv[1:] {
+		if !strings.HasPrefix(a, "-") {
+			return true
+		}
+	}
+	return false
 }
 
 // closeAll kills every shell window (used on application exit / restore).

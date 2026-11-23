@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -14,7 +15,9 @@ const baseText = "Основное приложение.\n\n" +
 	"ЛКМ-драг по тексту — выделить (история тоже), отпустить — в буфер; ЛКМ-клик — снять выделение\n" +
 	"PgUp/PgDn (Shift — тоже), Alt+k/j, колесо мыши (GUI) — прокрутка истории shell-окна\n" +
 	"Ctrl+Insert — копировать выделенное (после copy mode) · Shift+Insert — вставить из буфера · средняя кнопка мыши — вставить PRIMARY\n" +
-	"F7 — сохранить сессию · F8 — восстановить сессию · F9 — обзор окон (клик по миниатюре — вход)\n" +
+	"F7 — сохранить сессию · F8 — восстановить (в полноэкранной программе afm/mc/vim — Alt+F7/Alt+F8 или F12→WM)\n" +
+	"Сессия помнит программу на переднем плане (argv + каталог) и восстанавливает её best-effort; состояние внутри программы не сохраняется\n" +
+	"F9 — обзор окон (клик по миниатюре — вход)\n" +
 	"F12 — режим F-клавиш: auto (в полноэкранной программе F-клавиши уходят внутрь) / WM (всегда команды WM); Alt+Fn — всегда команды WM"
 
 // wmFKeyPassThrough reports whether an F-key must be handed to the focused
@@ -25,6 +28,42 @@ const baseText = "Основное приложение.\n\n" +
 func wmFKeyPassThrough(e *tcell.EventKey, shellInFullscreen bool) bool {
 	return shellInFullscreen && e.Modifiers()&tcell.ModAlt == 0 &&
 		e.Key() >= tcell.KeyF1 && e.Key() <= tcell.KeyF12
+}
+
+// summarizeSession renders a compact "2 shell, 1 afm" label for status lines.
+func summarizeSession(wins []SessionWindow) string {
+	if len(wins) == 0 {
+		return "empty"
+	}
+	counts := make(map[string]int)
+	order := make([]string, 0, len(wins))
+	for _, w := range wins {
+		label := w.Kind
+		if w.Kind == kindProg {
+			label = describeSessionWindow(w)
+		}
+		if counts[label] == 0 {
+			order = append(order, label)
+		}
+		counts[label]++
+	}
+	parts := make([]string, 0, len(order))
+	for _, label := range order {
+		if counts[label] > 1 {
+			parts = append(parts, fmt.Sprintf("%d×%s", counts[label], label))
+		} else {
+			parts = append(parts, label)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// fallbackNote reports program slots that were restored as plain shells.
+func fallbackNote(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d program(s) → shell)", n)
 }
 
 func main() {
@@ -53,10 +92,10 @@ func main() {
 	wm := newWM(app, base)
 	app.SetRoot(wm, true)
 
-	// Auto-restore the saved session on start (so `me wm` raises the last workspace).
+	// Auto-restore the saved session on start (so `me tess_wm` raises the last workspace).
 	if wins, err := loadSession(sessionFilePath()); err == nil && len(wins) > 0 {
-		wm.restore(wins)
-		setStatus(fmt.Sprintf("restored: %d window(s) from %s", len(wins), sessionFilePath()))
+		fb := wm.restore(wins)
+		setStatus(fmt.Sprintf("restored: %d window(s) from %s%s", len(wins), sessionFilePath(), fallbackNote(fb)))
 	}
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -95,7 +134,7 @@ func main() {
 				if err := saveSession(sessionFilePath(), wins); err != nil {
 					setStatus("save error: " + err.Error())
 				} else {
-					setStatus(fmt.Sprintf("saved: %d window(s) → %s", len(wins), sessionFilePath()))
+					setStatus(fmt.Sprintf("saved: %d window(s) (%s) → %s", len(wins), summarizeSession(wins), sessionFilePath()))
 				}
 				return nil
 			case tcell.KeyF8:
@@ -104,8 +143,8 @@ func main() {
 					setStatus("restore error: " + err.Error())
 					return nil
 				}
-				wm.restore(wins)
-				setStatus(fmt.Sprintf("restored: %d window(s) from %s", len(wins), sessionFilePath()))
+				fb := wm.restore(wins)
+				setStatus(fmt.Sprintf("restored: %d window(s) from %s%s", len(wins), sessionFilePath(), fallbackNote(fb)))
 				return nil
 			case tcell.KeyF9:
 				if wm.overviewOpen() {

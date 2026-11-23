@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -76,7 +77,37 @@ type shellWindow struct {
 	mouseMoved      bool // false until the pointer left the click cell
 }
 
+// newShellWindow starts an interactive bash in the given directory.
 func newShellWindow(app *tview.Application, dir string, onExit func(), wantsRedraw func() bool) (*shellWindow, error) {
+	return newPTYWindow(app, []string{"/bin/bash"}, dir, onExit, wantsRedraw)
+}
+
+// newProgramWindow starts an arbitrary program in a pty, e.g. a restored
+// foreground program (afm/micro/vim/...) in its saved directory.
+func newProgramWindow(app *tview.Application, argv []string, dir string, onExit func(), wantsRedraw func() bool) (*shellWindow, error) {
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("empty argv")
+	}
+	argv = append([]string(nil), argv...)
+	if !strings.ContainsRune(argv[0], '/') {
+		resolved, err := exec.LookPath(argv[0])
+		if err != nil {
+			return nil, fmt.Errorf("program %q: %w", argv[0], err)
+		}
+		argv[0] = resolved
+	}
+	return newPTYWindow(app, argv, dir, onExit, wantsRedraw)
+}
+
+// programTitle is the short window title for a program argv.
+func programTitle(argv []string) string {
+	if len(argv) == 0 {
+		return "shell"
+	}
+	return filepath.Base(argv[0])
+}
+
+func newPTYWindow(app *tview.Application, argv []string, dir string, onExit func(), wantsRedraw func() bool) (*shellWindow, error) {
 	w := &shellWindow{
 		Box:         tview.NewBox(),
 		app:         app,
@@ -88,9 +119,13 @@ func newShellWindow(app *tview.Application, dir string, onExit func(), wantsRedr
 	// scrollback for viewing long output (dmesg/logs/git log). 2000 lines
 	// bound that to a reasonable amount of memory per window.
 	w.emu.SetScrollbackSize(2000)
-	w.SetBorder(true).SetTitle(" shell ")
+	title := programTitle(argv)
+	if title == "bash" {
+		title = "shell"
+	}
+	w.SetBorder(true).SetTitle(" " + title + " ")
 
-	cmd := exec.Command("/bin/bash")
+	cmd := exec.Command(argv[0], argv[1:]...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
